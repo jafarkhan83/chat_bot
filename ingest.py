@@ -1,3 +1,5 @@
+ingest
+
 import os
 import pdfplumber
 import chromadb
@@ -10,6 +12,13 @@ print("Loading embedding model...")
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
 client = chromadb.PersistentClient(path="./vectordb")
+
+# To ensure a fresh start, delete the existing collection if it exists
+print("Checking for existing collection...")
+if "buitems" in [c.name for c in client.list_collections()]:
+    print("Deleting existing 'buitems' collection.")
+    client.delete_collection(name="buitems")
+
 collection = client.get_or_create_collection(name="buitems")
 
 def extract_text(pdf_path):
@@ -82,17 +91,11 @@ def chunk_text(text, chunk_size=800, overlap=150):
 pdf_folder = "./expdf"
 all_pdfs = []
 
-# Collect all PDFs with their folder info
-for folder in os.listdir(pdf_root):
-    folder_path = os.path.join(pdf_root, folder)
-    if os.path.isdir(folder_path):
-        for file in os.listdir(folder_path):
-            if file.endswith(".pdf"):
-                all_pdfs.append({
-                    "path":   os.path.join(folder_path, file),
-                    "folder": folder,
-                    "file":   file
-                })
+for root, dirs, files in os.walk(pdf_folder):
+    for f in files:
+        if f.endswith(".pdf"):
+            pdf_path = os.path.join(root, f)
+            all_pdfs.append(pdf_path)
 
 print(f"Found {len(all_pdfs)} PDFs\n")
 
@@ -108,46 +111,42 @@ else:
             
             print(f"[{idx}/{len(all_pdfs)}] Processing: {relative_path}")
 
-for idx, pdf_info in enumerate(all_pdfs, 1):
-    pdf_path = pdf_info["path"]
-    folder   = pdf_info["folder"]
-    filename = pdf_info["file"]
-    topic    = topic_map.get(folder, folder)
+            text = extract_text(pdf_path)
 
-    print(f"[{idx}/{len(all_pdfs)}] {folder}/{filename}")
-    print(f"  Topic: {topic}")
+            if not text.strip():
+                print(f"  ⚠️  No text found, skipping\n")
+                continue
 
-    text = extract_text(pdf_path)
+            chunks = chunk_text(text)
+            print(f"  → {len(chunks)} chunks created")
 
-    if not text.strip():
-        print(f"  ⚠️  No text found, skipping\n")
-        continue
+            embeddings = model.encode(
+                chunks,
+                batch_size=32,
+                show_progress_bar=False
+            ).tolist()
 
-    chunks = chunk_text(text)
-    print(f"  → {len(chunks)} chunks created")
+            ids = [f"{pdf_name}_chunk_{i}" for i in range(len(chunks))]
+            metadatas = [
+                {
+                    "source": pdf_name,
+                    "content_type": content_type
+                } 
+                for _ in chunks
+            ]
 
-    embeddings = model.encode(
-        chunks,
-        batch_size=32,
-        show_progress_bar=False
-    ).tolist()
+            collection.add(
+                ids=ids,
+                documents=chunks,
+                embeddings=embeddings,
+                metadatas=metadatas
+            )
 
-    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-        collection.add(
-            ids=[f"{folder}_{filename}_chunk_{i}"],
-            documents=[chunk],
-            embeddings=[embedding],
-            metadatas=[{
-                "topic":    topic,
-                "folder":   folder,
-                "filename": filename
-            }]
-        )
-
-    total_chunks += len(chunks)
-    print(f"  → Stored ✅\n")
+            print(f"  → Stored ✅\n")
+        except Exception as e:
+            print(f"  ❌ Error processing {relative_path}: {e}\n")
+            continue
 
 print("=" * 50)
-print(f"All PDFs ingested successfully!")
-print(f"Total chunks stored: {total_chunks}")
-print(f"Total PDFs processed: {len(all_pdfs)}")
+print("All PDFs ingested successfully!")
+print(f"Total chunks in DB: {collection.count()}")
